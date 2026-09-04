@@ -1649,3 +1649,246 @@ unaffected in any case: the distro tests cover dependency install and
 PAM-directory detection, the VM layer calls `bin/seal.sh` and the unseal
 helper directly, and none of them exercise the auth-line regex — which is
 exactly what `test/unit-regex-test.sh` covers, with no container needed.
+
+
+## Remaining review findings, not part of the upstream fix (2026-08-30)
+
+Kept local: these came out of the same read-through as the `-auth`
+detection bug but are separate from it, and each needs its own
+discussion upstream rather than riding along in that PR.
+
+**Finding 2 (ordering is load-bearing, worth stating explicitly in the
+README).** The insertion is "immediately before the `pam_gnome_keyring.so`
+line". On this machine `cinnamon-screensaver` is `@include common-auth`
+followed by that line, so the injected `PAM_AUTHTOK` lands *after*
+`pam_unix.so ... try_first_pass` has already run — no bypass. But that is
+luck of the layout, not something the installer checks: on any stack where
+`pam_gnome_keyring.so` sits *before* the authenticating modules, the same
+insertion would hand the unsealed keyring password to `pam_unix
+try_first_pass` and turn an `optional` module into a working screen-unlock
+/ login bypass (keyring password and login password are commonly the
+same). The module's own "always returns `PAM_IGNORE`, cannot grant login"
+guarantee is about its return code and stays true either way — the risk is
+in what a *later* module does with `PAM_AUTHTOK`, which the guarantee
+doesn't cover. Cheap defence: refuse to patch (or warn loudly) when no
+authenticating module precedes the matched line in the same file.
+
+**Finding 3 (hardening, low severity): the lock file lives in a
+world-writable directory.** `pam/tpm-keyring-unseal.sh` does
+`exec 9>/run/lock/tpm-keyring-unseal.lock` as root, and `/run/lock` is
+`drwxrwxrwt`, cleared on every boot. `fs.protected_symlinks=1` (the default
+on this machine and on mainstream distros) blocks the obvious
+root-follows-someone-else's-symlink truncation, so this is defence in
+depth, not a live hole — but a root-only directory (e.g.
+`/run/tpm-keyring-unlock/`, created `0700` at first use) removes the
+dependency on a sysctl the tool doesn't control.
+
+**Finding 4 (hardening, low severity): unvalidated user-controlled content
+used as a root process's argument.** The same helper, running as root,
+does `PRIMARY_HANDLE="$(cat "$DATA_DIR/primary.handle")"` out of the target
+user's `$HOME` and passes it straight to `tpm2_load -C`. It is quoted, so
+there is no word-splitting or command injection, and the file is inside the
+user's own trust domain — but the child's stderr is deliberately inherited
+into the journal, so a symlinked/attacker-substituted `primary.handle`
+turns one line of an arbitrary file into journal output on a system where
+desktop users are typically in `adm`. Validating `^0x[0-9A-Fa-f]{1,8}$`
+before use costs nothing.
+
+**Not a finding, but worth a verification step in the docs.** The seal's
+security rests on `tpm2_create -L policy` *without* `-p` clearing
+`TPMA_OBJECT_USERWITHAUTH` — if that attribute stayed set, the empty auth
+value would satisfy `TPM2_Unseal`'s USER-role check and the PCR7 policy
+would be decorative. tpm2-tools is documented to clear it in exactly this
+case, so the current code is believed correct; it just isn't asserted
+anywhere. A one-line check after sealing (`tpm2_readpublic -c` on the
+loaded sealed object, confirm `userwithauth` is absent from the printed
+attributes) would turn a believed-correct assumption into a tested one, and
+would fit naturally into `test/vm/run-vm-test.sh`, which already does a
+real seal/unseal round trip against a real PCR7 policy.
+
+**Threat-model note (README wording, not code).** "What this protects
+against: someone getting hold of your powered-off laptop and pulling the
+disk" is accurate but easy to over-read. PCR7 measures the Secure Boot
+state and the certificates used to validate what was loaded — not the
+kernel, initrd or cmdline. On a machine whose disk is not encrypted (the
+exact configuration this tool is *for*), an attacker with physical access
+can boot a Microsoft-signed live image on that same machine, land on the
+same PCR7 value, read `~/.local/share/tpm-keyring-unlock/` off the
+unencrypted disk and unseal it — no password anywhere in the chain. The
+protection is real against "disk removed and read elsewhere" and absent
+against "whole laptop stolen, booted from USB". Binding additional PCRs
+would narrow that, at the cost of a re-seal on every kernel/bootloader
+update, which is a genuine trade-off rather than an obvious win — but the
+README should say which of the two physical-access cases it does not
+cover.
+
+## Linux Mint's own gate: `pam_fingwit.so` blocks fingerprint at the login screen (2026-08-30, later)
+
+Symptom during the Mint test install, *after* the regex fix had the right
+PAM files wired: the greeter asked for a password instead of offering a
+fingerprint, so none of this tool's machinery ever ran. Not a bug in this
+repo, but every Mint 22.1+ tester will hit it, and it looks exactly like a
+broken install.
+
+Mint ships `libpam-fingwit`, whose `pam-auth-update` profile
+(`/usr/share/pam-configs/fingwit`, `Conflicts: fprintd`) puts a gate in
+front of `pam_fprintd`:
+
+```
+auth  [authinfo_unavail=1 default=ignore]  pam_fingwit.so
+auth  [success=2 default=ignore]           pam_fprintd.so max-tries=3 timeout=15
+auth  [success=1 default=ignore]           pam_unix.so nullok try_first_pass
+```
+
+`pam_fingwit.so` is a thin C wrapper around
+`/usr/lib/*/fingwit/pam_fingwit.py`, which is readable and decides:
+
+```python
+if user_has_session(user):                      # logind: any session with a seat
+    return PAM.PAM_IGNORE                       # ← short-circuits, gate skipped
+if is_login_session():                          # PAM_SERVICE in lightdm/gdm/login/...
+    if not settings.get_boolean("login-enabled"):
+        return PAM.PAM_AUTHINFO_UNAVAIL         # ← "authinfo_unavail=1" jumps over pam_fprintd
+    if has_encrypted_home(user):
+        return PAM.PAM_AUTHINFO_UNAVAIL
+```
+
+`org.x.fingwit login-enabled` defaults to `false`, and Fingwit's own GUI
+has no toggle for it — the whole system references that schema in exactly
+three places (`gschema.xml`, `pam_fingwit.py`, `/usr/bin/fingwit`) and none
+of them writes the key. Mint's reason for the default is precisely the
+problem this repo solves: a fingerprint login leaves the keyring locked.
+
+**The diagnostic trap, and why it cost an extra round trip:** logout ->
+login *worked*, a cold reboot did not. The only branch that can differ
+between those two is `user_has_session()` — after a logout, logind
+regularly still has a session for the user (leftover processes; `last`
+showed several "gone - no logout" entries), so the gate is skipped
+entirely and fingerprint is offered. After a real reboot there is no
+session, the gate applies, and the password prompt is back. So
+"logout/login works" is *not* evidence that fingerprint login works;
+only a reboot tests the real path.
+
+**The second trap: whose settings does the module read?** It runs as root
+inside the display manager's PAM process, so `Gio.Settings` resolves
+root's backend, not the logging-in user's. On the test machine the user's
+GSettings were keyfile-backed (`~/.config/glib-2.0/settings/keyfile`,
+which GLib prefers once it exists) while root's were dconf-backed, so
+`gsettings set org.x.fingwit login-enabled true` as the user changed
+nothing that the module could see. The exact code path, run as root, is
+the only reliable check:
+
+```
+sudo -H python3 -c "import gi; gi.require_version('Gio','2.0'); \
+  from gi.repository import Gio; \
+  print(Gio.Settings(schema_id='org.x.fingwit').get_boolean('login-enabled'))"
+```
+
+Fix that made it work: `sudo -H dconf write /org/x/fingwit/login-enabled
+true`, verified with the line above, then confirmed across a real reboot.
+The alternative is `pam-auth-update` switching from the `fingwit` profile
+to the plain `fprintd` one, which removes the gate from `common-auth`
+entirely - cleaner in the long run, but it edits a login-critical file, so
+it's the second choice, not the first.
+
+Worth a Mint section in the README: this gate, the reboot-vs-logout trap,
+and the root-side check.
+
+## Multi-user install on the Mint test machine (2026-08-30, later) — per-user steps, and a shared-handle hazard
+
+Second user appeared on the test machine (`lamadi`, uid 1000, alongside
+`zasage`, uid 1001; both have enrolled fingerprints, neither home is
+ecryptfs). Sorting out what `install.sh` does once per *machine* versus
+once per *user* surfaced one genuine multi-user bug.
+
+**Once per machine (already done by the first user's run):** the compiled
+`pam_tpm_keyring_authtok.so`, `/usr/local/sbin/tpm-keyring-unseal`, and the
+`/etc/pam.d/*` edits. A second user's run of `install.sh` correctly
+no-ops on these — the PAM-file loop already checks `grep -q
+pam_tpm_keyring_authtok.so` per file and prints "already had the module
+wired in - left unchanged".
+
+**Once per user, and easy to miss:**
+1. `bin/seal.sh` — the sealed blob lives in `$HOME/.local/share/
+   tpm-keyring-unlock`, so every user needs their own, sealed with *their
+   own* keyring password.
+2. `systemctl --user mask gnome-keyring-daemon.socket
+   gnome-keyring-daemon.service` — a **user** unit mask
+   (`~/.config/systemd/user/*.service -> /dev/null`). The first user's mask
+   does nothing for the second user, who therefore still has the original
+   systemd/PAM race.
+3. `tss` group membership — needed only to *create* the seal;
+   the login-time unseal runs as root and doesn't care.
+
+A user without step 1 shows exactly the symptom seen here: fingerprint
+login works, `pam_tpm_keyring_authtok` runs, the helper finds no
+`seal.priv`, exits non-zero, the module logs "produced no usable output"
+and returns `PAM_IGNORE`, and the keyring prompt appears by hand later.
+That is the designed failure mode, not a bug — but from the user's side it
+looks identical to a broken install.
+
+**The bug: `PRIMARY_HANDLE_DEFAULT=0x81018000` is shared across users, and
+`uninstall.sh` evicts it unconditionally.** Sharing itself is fine and even
+elegant — the primary is deterministic, so the second user's `seal.sh` hits
+the existing-object branch, compares names, matches, and reuses it rather
+than clobbering. But `uninstall.sh` offers "Evict the persisted TPM primary
+key at $PRIMARY_HANDLE?" with no notion that another user's `seal.priv` is
+loaded under that same handle. Say yes, and every *other* user's unseal
+starts failing: `pam/tpm-keyring-unseal.sh` reads their still-present
+`primary.handle`, passes it to `tpm2_load -C 0x81018000`, and the load
+fails against the now-empty handle. There is no recovery path, because the
+recreate-the-primary fallback only triggers when `primary.handle` is
+*absent* — an existing file pointing at an evicted handle is a hard
+failure. Symptom for the other user: keyring silently stops auto-unlocking
+after someone else uninstalled, with a log line that says nothing about
+why.
+
+Two candidate fixes, both cheap, not implemented here:
+- Make the unseal helper fall back to `tpm2_createprimary` when
+  `tpm2_load -C <handle>` fails, not just when the handle file is missing.
+  Restores the pre-2026-08-16 slow path instead of breaking outright, and
+  is a strict improvement even single-user (it also covers a handle evicted
+  by anything else).
+- Have `uninstall.sh` check whether any *other* user's `$HOME/.local/share/
+  tpm-keyring-unlock/primary.handle` names the same handle before offering
+  to evict it, and skip/warn if so.
+
+**Unrelated to this tool, worth recording because it looks related:**
+switching between users with the mouse in the LightDM/slick greeter makes
+the fingerprint prompt disappear for the second-selected user. Both users
+have enrolled prints (`fprintd-list lamadi`, `fprintd-list zasage`), so it
+isn't an enrollment gap — `fprintd` allows one device claim at a time, and
+the greeter's first PAM conversation still holds (or is still releasing)
+the claim when the second one starts. `pam_fprintd max-tries=3 timeout=15`
+also means the prompt goes away on its own after 15s at the greeter. No
+part of this repo participates in that; noting it so the next person
+doesn't chase it as a `pam_tpm_keyring_authtok` bug.
+
+### Correction to the greeter note above (2026-08-30, later)
+
+The multi-user entry above guessed that the vanishing fingerprint prompt on
+greeter user-switch was an `fprintd` device-claim conflict. That was wrong,
+and the guess is superseded by evidence: the journal from a reproduction
+shows `fprintd.service: Main process exited, code=dumped, status=11/SEGV`
+at each switch, with `pam_fprintd` reporting "GetDevices failed: Message
+recipient disconnected from message bus without replying" — the daemon dies
+rather than refusing a second claim.
+
+Root cause is in libfprint's realtek driver, not in fprintd, the greeter, or
+anything in this repo: `fp_verify_ssm_done()` (and its enroll/init/delete
+siblings) overwrite the owned `GError` copy handed to the completion
+callback with the borrowed pointer from `fpi_ssm_get_error()`, which
+`fpi_ssm_free()` frees immediately after the callback returns. fprintd then
+formats a dangling error and dies. Cancelling a running verify — exactly
+what switching users in the greeter does — takes that path every time.
+
+Fixed upstream in libfprint `26d38779` (2026-08-28), two days after the
+`v1.94.100` tag this machine had built, and reported against this same
+hardware. Resolution here: cherry-picked onto v1.94.100, rebuilt, full
+suite green (38 passed, 2 skipped), installed over the local build.
+
+Recorded here because the misdiagnosis cost a round trip: "the fingerprint
+prompt disappeared" looks like a PAM/greeter problem and reads like one in
+every log line *except* the `code=dumped` one. When fingerprint auth
+behaves oddly, check whether `fprintd` is still alive before theorising
+about PAM.
