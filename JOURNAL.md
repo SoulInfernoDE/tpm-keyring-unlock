@@ -2006,3 +2006,26 @@ Reporting finding 2 and the `USERWITHAUTH` check upstream was offered and
 **declined for now**. Both therefore stay unreported upstream and public only
 through this journal - which is the state the next person should assume, and
 re-check with the `gh search issues` line above before acting on either.
+
+## German README for the fork (2026-09-15)
+
+Added `README.de.md` and a language switch at the top of `README.md`. This is
+the owner's documentation rule for their repositories - English first, a
+German second version mandatory - applied to this fork after they confirmed it
+should cover this repo too, even though the project is upstream's.
+
+Kept deliberately fork-only: it is not part of PR #6 and should not ride along
+in any upstream PR, since upstream never asked for a second language and would
+then have to maintain it. The cost is a new obligation here: **whenever
+`README.md` changes, `README.de.md` has to change with it**, or the German
+version quietly starts describing a different tool. The same applies when
+syncing `main` with upstream after #6 or #11 land - both touch the README
+(#11 rewrites the threat model section).
+
+The translation is faithful, not adapted. It keeps upstream's clone URL and
+upstream's threat-model wording as they are, including the sentence issue #8
+is about; correcting that belongs in `README.md` first (which #11 does
+upstream), and only then in the translation. Links to `CONTRIBUTING.md` and
+`JOURNAL.md` are marked as English-only rather than translated: the rule was
+applied to the README, and the journal is a working log, not user
+documentation.
