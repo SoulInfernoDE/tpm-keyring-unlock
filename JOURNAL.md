@@ -1653,6 +1653,13 @@ exactly what `test/unit-regex-test.sh` covers, with no container needed.
 
 ## Remaining review findings, not part of the upstream fix (2026-08-30)
 
+> **Partly superseded, and not kept local after all (2026-09-15).** Despite
+> "Kept local" below, this entry was pushed to the public fork on 2026-09-04,
+> before findings 2-4 had been reported anywhere. Finding 4 is now fixed
+> upstream in PR #11, which found it worse than stated here; finding 3 was
+> rated too low here. Finding 2's general check and the `USERWITHAUTH`
+> assertion are still unreported. See the 2026-09-15 entry.
+
 Kept local: these came out of the same read-through as the `-auth`
 detection bug but are separate from it, and each needs its own
 discussion upstream rather than riding along in that PR.
@@ -1892,3 +1899,110 @@ prompt disappeared" looks like a PAM/greeter problem and reads like one in
 every log line *except* the `code=dumped` one. When fingerprint auth
 behaves oddly, check whether `fprintd` is still alive before theorising
 about PAM.
+
+
+## Audit against CLAUDE.md after a context reset: a disclosure slip, and a fork that now leads upstream (2026-09-15)
+
+A long session's context was compacted, and the summary that carried the
+rules forward paraphrased the "other standing rules" and dropped the
+"Security of stored data comes first" section entirely. CLAUDE.md itself had
+not changed (tracked, last touched in `0dff22b`). Re-reading it in full and
+checking every action taken since the reset against it turned up the
+following. Worth recording mainly as a warning: a rule that is only
+*remembered* rather than re-read gets applied by its letter, and this repo's
+most important rule is not a letter-shaped one.
+
+**The disclosure slip.** On 2026-09-04 the user asked for "our changes" to be
+pushed to the fork if they weren't already. `c940ca8` (the `-auth` fix) was
+only on the PR branch, so it was pushed to `fork/main` - correctly. The
+uncommitted JOURNAL.md was committed alongside it (`16f1e2e`, pushed
+2026-09-04 21:46 +0200) without a separate question, and that journal held
+the 2026-08-30 findings entry that says, in its first line, "Kept local". The
+fork is public. Nobody noticed the contradiction because the commit rule was
+being checked ("did the user say push?") and the security principle was not
+("should this be public yet?").
+
+Timeline, from `git reflog show fork/main` and the GitHub API:
+
+- 2026-09-04 21:46 - findings 2, 3, 4 and the `USERWITHAUTH` note public on
+  `SoulInfernoDE/tpm-keyring-unlock` `main`.
+- 2026-09-15 16:50 UTC - maintainer opens upstream PR #11 ("survive eviction
+  of the shared TPM primary, and say what PCR7 protects").
+
+Checked what was already public *before* the push, so the slip isn't
+overstated: issues #7 (shared-handle eviction) and #8 (PCR7 threat model)
+were filed upstream earlier, and PR #6's body already discussed the ordering
+hazard - but only as "checked, safe" for the three Mint files, never as the
+general case. So the genuinely new public content was: finding 2 in its
+general form (the installer does not verify that an authenticating module
+precedes the insertion point, and on a stack where it doesn't, an `optional`
+module becomes a login/screen-unlock bypass), findings 3 and 4, and the
+`USERWITHAUTH` note.
+
+**What PR #11 says about the same findings - and where it corrects this
+journal.**
+
+- Finding 4 (`primary.handle` unvalidated): *fixed* in #11, and it is worse
+  than written here. `tpm2_load -C` is `--parent-context` and accepts a
+  context-**file path** as readily as a handle, so a user-controlled file
+  steers what the root helper *opens* during authentication - not merely one
+  line of a file leaking into the journal, which is how it was framed on
+  2026-08-30. Now validated against the TPM persistent-object range at all
+  three read sites.
+- Finding 3 (`/run/lock`): *not* fixed, listed in #11 under "left for their
+  own issues", and rated higher than here. This journal called it defence in
+  depth resting on `fs.protected_symlinks`. #11 points out the part that
+  sysctl doesn't touch: any local user can simply *hold* that lock and stall
+  every login for the full `flock -w 10`, then fail the unseal - a local
+  denial of service against login, no symlink needed. The earlier assessment
+  looked only at the file-clobbering angle.
+- #11 also lists two findings not in this journal: the helper doesn't verify
+  `$DATA_DIR` ownership or reject symlinks (and the blob has no auth value,
+  so nothing binds it to a user), and `uninstall.sh` removes the PAM module
+  and helper with no prompt at all.
+- Finding 2's general check and the `USERWITHAUTH` assertion: in neither
+  #11 nor any other upstream issue or PR. Searched with
+  `gh search issues <term> --repo dmitriitimoshenko/tpm-keyring-unlock
+  --include-prs` for `try_first_pass`, `ordering`, `bypass`, `userwithauth`;
+  the only hits were PR #6 (Mint-specific, "safe") and #11 (unrelated
+  context).
+
+Reporting channel, for whoever picks this up: upstream has private
+vulnerability reporting **disabled** (`gh api
+repos/dmitriitimoshenko/tpm-keyring-unlock/private-vulnerability-reporting`
+-> `enabled=false`) and no `SECURITY.md`. A public issue is the only
+in-GitHub route; since finding 2 is already public on the fork, an issue adds
+no new exposure and gets it in front of the one person who can fix it.
+Rewriting the fork's history to remove the entry was considered and rejected:
+it has been public for eleven days, a force-push would not un-disclose it, and
+it would destroy the record of what went wrong.
+
+**The fork now deliberately leads upstream.** `fork/main` carries `c940ca8`
+while upstream PR #6 is still open, and `greeter-fprint`'s README points
+Linux Mint users at this fork *because* it has that fix. That turns the fork
+from a PR staging area into something people install from, which has a
+maintenance consequence: when #6 and #11 land upstream, `fork/main` has to be
+reconciled with upstream promptly, or Mint users following that README get a
+fork that is *behind* on #11's security fixes while being ahead on #6. A fork
+that is recommended must not quietly go stale.
+
+**Also in the README recommendation (greeter-fprint, not this repo):** it
+describes the seal as released "only when the machine boots into the same
+Secure Boot state" and does not carry the caveat this repo's own issue #8 is
+about - on an unencrypted disk, a stolen *machine* booted from a signed live
+image reaches the same PCR7 value. The sentence is true and is exactly the
+over-readable kind #8 warns about.
+
+**Checked and clean, for completeness:** no secret was handled or typed; no
+`sudo` command was executed (every command in the session was Xephyr, ninja,
+ffmpeg, gh or git); nothing under `/etc/pam.d/` was touched; every push to
+`greeter-fprint` and `screensaver-fprint` had an explicit, fresh "yes".
+
+**Decisions taken on this audit (2026-09-15).** The user approved: committing
+and pushing this entry; adding the #8 caveat to greeter-fprint's keyring
+recommendation; and restricting `GREETER_FPRINT_RENDER` in greeter-fprint to
+`--test-mode`, so the hook can never act inside a real LightDM session.
+Reporting finding 2 and the `USERWITHAUTH` check upstream was offered and
+**declined for now**. Both therefore stay unreported upstream and public only
+through this journal - which is the state the next person should assume, and
+re-check with the `gh search issues` line above before acting on either.
