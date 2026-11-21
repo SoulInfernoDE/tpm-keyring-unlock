@@ -5,7 +5,10 @@
 # history, or anywhere outside this process.
 set -euo pipefail
 
-DATA_DIR="$HOME/.local/share/tpm-keyring-unlock"
+# TPM_KEYRING_DATA_DIR: where the sealed object goes instead of the caller's own
+# data directory - set only by proxmox/seal-guest.sh, which seals on a
+# Proxmox VE host for a user inside one of its containers.
+DATA_DIR="${TPM_KEYRING_DATA_DIR:-$HOME/.local/share/tpm-keyring-unlock}"
 PCR_BANK="sha256:7"
 
 # shellcheck source=lib.sh

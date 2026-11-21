@@ -198,6 +198,38 @@ headless — no GDM, no `libfprint`). If you hit something broken on one of
 these, that's a real bug report, not a "this was never claimed to work"
 situation — please open an issue.
 
+## Proxmox VE containers (fork only)
+
+A container on a Proxmox VE host has no TPM of its own, and when nobody logs
+in to it after it starts - programs are started there remotely, for example
+over xpra - no login unlocks its keyring at all. The guest mode in
+`proxmox/` covers that case from the host, which has the TPM:
+
+```bash
+# as root on the Proxmox VE host, in your own terminal
+proxmox/install-guest.sh CTID USER
+```
+
+It installs `tpm2-tools` on the host if needed, installs
+`/usr/local/sbin/tpm-keyring-unlock-guest` (root:root 0700) and seals the
+keyring password of USER in container CTID into the host's TPM, bound to the
+host's PCR7 like a local seal (`bin/seal.sh` does the sealing; you type the
+password). The sealed object stays on the host, in
+`/root/.local/share/tpm-keyring-unlock/guests/CTID-USER`.
+
+`tpm-keyring-unlock-guest CTID USER` unlocks that user's login keyring when it
+is locked: the host unseals the password and pipes it straight into the
+container (`pct exec`), where the running keyring daemon is unlocked over its
+own D-Bus interface (`UnlockWithMasterPassword`). It is never
+written to disk, never on a command line and never printed; the caller only
+gets the exit status (0 unlocked, 3 was unlocked already, 2 nothing sealed,
+1 failure - re-seal after a Secure Boot update or a password change).
+
+The container itself is not changed and gets no TPM device - giving it
+`/dev/tpmrm0` would also let it extend the host's PCRs. Anyone who is root on
+the host can unlock the keyring this way; root on the host can reach the
+container's data anyway.
+
 ## Uninstall
 
 ```bash

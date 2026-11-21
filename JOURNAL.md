@@ -2029,3 +2029,59 @@ upstream), and only then in the translation. Links to `CONTRIBUTING.md` and
 `JOURNAL.md` are marked as English-only rather than translated: the rule was
 applied to the README, and the journal is a working log, not user
 documentation.
+
+
+## Proxmox guest mode: the host unseals for a container (2026-11-21)
+
+Need: a Linux Mint container on a Proxmox VE host that is used mostly
+remotely: programs are started there in an xpra session from other
+computers. After the container restarts, nobody logs
+in to it, so no PAM stack ever runs and its login keyring stays locked;
+Electron programs then start logged out. The owner asked to use this tool
+for that case.
+
+Options weighed:
+- **Pass the host TPM into the container** (`devN: /dev/tpmrm0`) and install
+  the normal tool there. Rejected: the container would get the whole TPM,
+  including extending the host's PCRs (PCR7 included), which could break
+  anything sealed on the host until its next reboot; `require_secure_boot`
+  cannot see the host's efivars from a container and would have to be
+  weakened; and the container would need a restart. Also nothing logs in, so
+  the PAM module would not run anyway.
+- **The host unseals and hands the password to the container** - chosen.
+  The host has the TPM and verifiable Secure Boot; root on the host can reach
+  the container's data anyway, so this adds no new party that can unlock.
+
+Design:
+- `bin/seal.sh` takes `TPM_KEYRING_DATA_DIR` (only set by
+  `proxmox/seal-guest.sh`); everything else in it - Secure Boot check,
+  persisted primary at 0x81018000 with its ownership check, PCR7 policy - is
+  used unchanged, so there is one sealing path, not two.
+- `proxmox/tpm-keyring-unlock-guest.sh` repeats the unseal steps of
+  `pam/tpm-keyring-unseal.sh` instead of calling it: that helper takes a user
+  name and looks in the user's home on the machine it runs on, and it stays
+  untouched for its PAM caller. It shares its flock.
+- The password goes from `tpm2_unseal` (command substitution, in memory of the
+  root helper only) through `printf` (a builtin - no argv) into a pipe to
+  `pct exec CTID -- runuser -u USER -- python3 -I -c ...`, which reads it on
+  stdin and calls `UnlockWithMasterPassword` on gnome-keyring's
+  `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface` (the call
+  Seahorse uses) for the login collection, with a "plain" Secret Service
+  session. The helper prints nothing; callers only see the exit status.
+- Dead end first: `gnome-keyring-daemon --unlock` with the password on stdin.
+  Tried in the container with a deliberately wrong password (2026-11-21):
+  the login collection stayed locked as expected, but the call also started a *third*
+  daemon (`gnome-keyring-daemon --unlock`, left running) next to the two
+  already there - `--start --foreground --components=secrets` from D-Bus
+  activation and `--foreground --components=pkcs11,secrets
+  --control-directory=/run/user/UID/keyring` from the systemd unit, which
+  owned `org.freedesktop.secrets`. So it did not reliably talk to the running
+  daemon; the D-Bus call does, and fails cleanly on a wrong password.
+- It first asks the container over D-Bus whether the login collection is
+  locked and does not touch the TPM when it is not (exit 3), so callers may
+  run it before every program start.
+
+Not done: no PAM change on the host or in the container, no TPM device in the
+container. A Secure Boot update on the host (new db/dbx) changes PCR7 and
+makes the unseal fail (exit 1) until `proxmox/seal-guest.sh` is run again;
+callers then have to fall back to GNOME's unlock dialog.

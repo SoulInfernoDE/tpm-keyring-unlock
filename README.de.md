@@ -212,6 +212,41 @@ Fingerabdruck (die VM-Ebene läuft ohne Oberfläche – kein GDM, kein `libfprin
 Stößt du bei einem davon auf einen Fehler, ist das ein echter Fehlerbericht, kein
 „das wurde nie behauptet“ – bitte eröffne ein Issue.
 
+## Proxmox-VE-Container (nur im Fork)
+
+Ein Container auf einem Proxmox-VE-Host hat kein eigenes TPM, und wenn sich
+nach seinem Start niemand anmeldet - Programme werden dort aus der Ferne
+gestartet, etwa über xpra -, entsperrt keine Anmeldung seinen
+Schlüsselbund. Der Gastmodus in `proxmox/` löst das vom Host aus, der das TPM
+hat:
+
+```bash
+# als root auf dem Proxmox-VE-Host, im eigenen Terminal
+proxmox/install-guest.sh CTID BENUTZER
+```
+
+Das installiert bei Bedarf `tpm2-tools` auf dem Host, installiert
+`/usr/local/sbin/tpm-keyring-unlock-guest` (root:root 0700) und versiegelt das
+Schlüsselbund-Passwort von BENUTZER in Container CTID im TPM des Hosts,
+gebunden an PCR7 des Hosts wie beim lokalen Versiegeln (`bin/seal.sh`
+versiegelt; das Passwort gibt man selbst ein). Das versiegelte Objekt bleibt
+auf dem Host, in `/root/.local/share/tpm-keyring-unlock/guests/CTID-BENUTZER`.
+
+`tpm-keyring-unlock-guest CTID BENUTZER` entsperrt den Login-Schlüsselbund
+dieses Benutzers, wenn er gesperrt ist: Der Host entsiegelt das Passwort und
+leitet es direkt in den Container (`pct exec`), wo der laufende
+Schlüsselbund-Dienst über seine eigene D-Bus-Schnittstelle
+(`UnlockWithMasterPassword`) entsperrt wird.
+Es landet nie auf einer Platte, nie in einer Befehlszeile und wird nie
+ausgegeben; der Aufrufer bekommt nur den Rückgabewert (0 entsperrt, 3 war schon
+entsperrt, 2 nichts versiegelt, 1 Fehler - nach einem Secure-Boot-Update oder
+einer Passwortänderung neu versiegeln).
+
+Der Container selbst wird nicht verändert und bekommt kein TPM-Gerät - mit
+`/dev/tpmrm0` könnte er auch die PCRs des Hosts erweitern. Wer auf dem Host
+root ist, kann den Schlüsselbund so entsperren; root auf dem Host erreicht die
+Daten des Containers ohnehin.
+
 ## Deinstallation
 
 ```bash
